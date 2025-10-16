@@ -1,1 +1,2 @@
-# customerchurn
+Customer Risk Analysis Model
+A Python-based machine learning script for predicting customer churn risk using a neural network. Leverages features like call compliance, payment status, and industry to categorize clients into Low, Medium, and High risk groups. Includes data preprocessing, SMOTE for class imbalance, and generates detailed visualizations and reports (e.g., risk distribution, churn probability). Built with TensorFlow, scikit-learn, and pandas for robust analysis of customer datasets.

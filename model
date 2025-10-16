@@ -1,0 +1,529 @@
+# Full Customer Risk Analysis (unified Overall_Risk_Category + robust exports)
+try:
+    from scikeras.wrappers import KerasClassifier
+except ModuleNotFoundError:
+    !pip install scikeras
+    from scikeras.wrappers import KerasClassifier
+
+import os
+import io
+import random
+import warnings
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import tensorflow as tf
+
+from google.colab import files
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.impute import KNNImputer
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, precision_recall_curve, roc_curve, auc
+from sklearn.utils.class_weight import compute_class_weight
+from imblearn.over_sampling import SMOTE
+
+warnings.filterwarnings("ignore")
+
+# reproducibility (best-effort)
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+tf.random.set_seed(SEED)
+
+# Colors used in plots
+RISK_COLORS = {'Low': '#4CAF50', 'Medium': '#FFA500', 'High': '#FF4444', 'High_Unpaid_Crisis': '#FF0000', 'Potential_Future_Unpaid': '#FF8C00'}
+
+def setup_plot_style():
+    sns.set_style('whitegrid')
+    sns.set_palette('deep')
+
+# ----------------------------
+# Preprocessing
+# ----------------------------
+def preprocess_data(data, numerical_features, categorical_features):
+    # clean column names
+    data.columns = data.columns.str.strip()
+    print("Debug: Starting preprocess_data...")
+
+    # filter lists for columns actually present
+    num_feats = [c for c in numerical_features if c in data.columns]
+    missing_num = set(numerical_features) - set(num_feats)
+    if missing_num:
+        print(f"Warning: Missing numerical columns (will be skipped for imputation): {sorted(list(missing_num))}")
+
+    cat_feats = [c for c in categorical_features if c in data.columns]
+    missing_cat = set(categorical_features) - set(cat_feats)
+    if missing_cat:
+        print(f"Warning: Missing categorical columns (will be skipped for encoding): {sorted(list(missing_cat))}")
+
+    # Convert numerical to numeric
+    for col in num_feats:
+        before_non_num = data[col].isna().sum()
+        data[col] = pd.to_numeric(data[col], errors='coerce')
+        after_non_num = data[col].isna().sum()
+        if after_non_num > 0:
+            print(f"Debug: {col} non-numeric -> coerced to NaN: {after_non_num}")
+
+    # Impute numeric columns using KNNImputer (only on present numeric features)
+    if len(num_feats) > 0:
+        imputer = KNNImputer(n_neighbors=5)
+        data[num_feats] = imputer.fit_transform(data[num_feats])
+        for col in num_feats:
+            print(f"Debug: {col} NaN after imputation: {data[col].isna().sum()}")
+
+    # Initialize rule-based risk (fallback) using Payment Status and Quality % if available
+    if ('Payment Status' in data.columns) and ('Quality %' in data.columns):
+        data['Overall_Risk_Category'] = np.where(
+            data['Payment Status'].astype(str).str.lower() == 'unpaid', 'High',
+            np.where(data['Quality %'] < 0.55, 'Medium', 'Low')
+        )
+    elif 'Quality %' in data.columns:
+        data['Overall_Risk_Category'] = np.where(data['Quality %'] < 0.55, 'Medium', 'Low')
+    elif 'Payment Status' in data.columns:
+        data['Overall_Risk_Category'] = np.where(data['Payment Status'].astype(str).str.lower() == 'unpaid', 'High', 'Low')
+    else:
+        # best-effort default
+        data['Overall_Risk_Category'] = 'Low'
+        print("Warning: Neither 'Payment Status' nor 'Quality %' present — defaulting initial Overall_Risk_Category to 'Low'")
+
+    print("Debug: Initial Risk Category distribution:\n", data['Overall_Risk_Category'].value_counts(normalize=True) * 100)
+    print("Debug: preprocess_data completed successfully")
+    return data, num_feats, cat_feats
+
+# ----------------------------
+# Create comprehensive risk analysis (apply model, compute scores, exports)
+# ----------------------------
+def create_comprehensive_risk_analysis(data, model, scaler, feature_columns, X_test, y_test, label_encoder):
+    # Safety: ensure feature columns exist
+    missing_features = [c for c in feature_columns if c not in data.columns]
+    if missing_features:
+        raise ValueError(f"The following feature columns used for modeling are missing from data: {missing_features}")
+
+    # scale all rows for predictions
+    X_all_scaled = scaler.transform(data[feature_columns])
+    probs = model.predict_proba(X_all_scaled)  # shape (n_samples, n_classes)
+    preds_idx = np.argmax(probs, axis=1)
+
+    # convert indices back to labels using the label encoder that was used in training
+    data['Overall_Risk_Category'] = label_encoder.inverse_transform(preds_idx)
+
+    # ensure we have a 'High' probability column; fallback if not present
+    if 'High' in label_encoder.classes_:
+        high_idx = int(label_encoder.transform(['High'])[0])
+        high_prob_column = probs[:, high_idx]
+    else:
+        # fallback: take probability of most-likely class per sample converted to 0..1
+        high_prob_column = probs.max(axis=1)
+        print("Warning: 'High' not in label encoder classes. Using max probability as Predictive_Churn_Probability fallback.")
+
+    data['Predictive_Churn_Probability'] = high_prob_column
+    # Priority score is a blend of model probability + rule-based flags (adjust weights as needed)
+    payment_unpaid_flag = (data['Payment Status'] == 'Unpaid') if 'Payment Status' in data.columns else pd.Series(0, index=data.index)
+    quality_flag = (data['Quality %'] < 0.55) if 'Quality %' in data.columns else pd.Series(0, index=data.index)
+
+    data['Priority_Score'] = (
+        0.6 * data['Predictive_Churn_Probability'] +
+        0.3 * payment_unpaid_flag.astype(int) +
+        0.1 * quality_flag.astype(int)
+    )
+
+    # Save full predictions file
+    full_output = "comprehensive_risk_clients.csv"
+    data.to_csv(full_output, index=False)
+    print(f"Debug: Saved full dataset → {full_output}")
+
+    # Save flagged (High + Medium) clients
+    flagged_output = "flagged_risk_clients.csv"
+    flagged_clients = data[data['Overall_Risk_Category'].isin(['High', 'Medium'])]
+    flagged_clients.to_csv(flagged_output, index=False)
+    print(f"Debug: Saved flagged risk clients → {flagged_output}")
+
+    # Save a test-set specific CSV (predictions for test rows)
+    if X_test is not None:
+        try:
+            X_test_scaled = scaler.transform(X_test[feature_columns])
+            test_probs = model.predict_proba(X_test_scaled)
+            test_preds = np.argmax(test_probs, axis=1)
+            test_data = data.loc[X_test.index].copy()
+            test_data['Predicted_Risk'] = label_encoder.inverse_transform(test_preds)
+            test_data['Predicted_High_Probability'] = test_probs[:, int(label_encoder.transform(['High'])[0])] if 'High' in label_encoder.classes_ else test_probs.max(axis=1)
+            test_data.to_csv('full_test_set.csv', index=False)
+            print("Debug: full_test_set.csv exported.")
+        except Exception as e:
+            print("Warning: Could not export full_test_set.csv (scaling/prediction on X_test failed):", str(e))
+
+    # Export all predictions
+    try:
+        data.to_csv('all_predictions.csv', index=False)
+        print("Debug: all_predictions.csv exported.")
+    except Exception as e:
+        print("Warning: Could not export all_predictions.csv:", str(e))
+
+    return data
+
+# ----------------------------
+# Dashboards & Reports
+# ----------------------------
+def create_comprehensive_dashboard(data, feature_columns):
+    setup_plot_style()
+    plt.figure(figsize=(20, 15))
+
+    # subplot 1: risk distribution
+    plt.subplot(2, 2, 1)
+    risk_counts = data['Overall_Risk_Category'].value_counts()
+    risk_df = risk_counts.reset_index()
+    risk_df.columns = ['Risk', 'Count']
+    colors = [RISK_COLORS.get(r, '#333333') for r in risk_df['Risk']]
+    sns.barplot(data=risk_df, x='Risk', y='Count', palette=colors)
+    plt.title('Distribution of Risk Categories')
+    plt.xlabel('Risk Category')
+
+    # subplot 2: churn prob vs priority (for high-risk)
+    plt.subplot(2, 2, 2)
+    high_risk = data[data['Overall_Risk_Category'].isin(['High', 'High_Unpaid_Crisis', 'Potential_Future_Unpaid'])]
+    if 'Priority_Score' in high_risk.columns and not high_risk.empty:
+        sns.scatterplot(x='Predictive_Churn_Probability', y='Priority_Score', hue='Overall_Risk_Category',
+                        size='Priority_Score', sizes=(20, 200), palette=RISK_COLORS, data=high_risk)
+        plt.title('Churn Probability vs Priority Score')
+    else:
+        plt.text(0.5, 0.5, "No high-risk data / Priority_Score missing", ha='center')
+
+    # subplot 3: correlations with priority
+    plt.subplot(2, 2, 3)
+    if 'Priority_Score' in data.columns and any([c in data.columns for c in feature_columns]):
+        corr_feats = [c for c in feature_columns if c in data.columns]
+        correlations = data[corr_feats + ['Priority_Score']].corr(numeric_only=True)['Priority_Score'].drop('Priority_Score')
+        corr_df = correlations.reset_index()
+        corr_df.columns = ['Feature', 'Correlation']
+        sns.barplot(data=corr_df, x='Correlation', y='Feature')
+        plt.title('Feature Correlations with Priority Score')
+    else:
+        plt.text(0.5, 0.5, "Priority_Score or features missing", ha='center')
+
+    # subplot 4: payment status vs churn probability
+    plt.subplot(2, 2, 4)
+    if 'Predictive_Churn_Probability' in data.columns and 'Payment Status' in data.columns:
+        payment_risk = data.groupby('Payment Status')['Predictive_Churn_Probability'].mean().sort_values()
+        pay_df = payment_risk.reset_index()
+        pay_df.columns = ['Payment Status', 'Avg_Churn_Prob']
+        sns.barplot(data=pay_df, x='Avg_Churn_Prob', y='Payment Status')
+        plt.title('Average Churn Probability by Payment Status')
+    else:
+        plt.text(0.5, 0.5, "Payment Status or Predictive_Churn_Probability missing", ha='center')
+
+    plt.tight_layout()
+    plt.savefig('comprehensive_dashboard.png')
+    plt.close()
+    print("Debug: comprehensive_dashboard.png saved.")
+
+def create_model_performance_report(y_test, y_pred, y_pred_proba_pos, label_encoder):
+    setup_plot_style()
+    plt.figure(figsize=(15, 10))
+
+    unique_classes = np.unique(y_test)
+    target_names = label_encoder.inverse_transform(unique_classes)
+    cm = confusion_matrix(y_test, y_pred, labels=unique_classes)
+
+    plt.subplot(2, 2, 1)
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', cbar=False,
+                xticklabels=target_names, yticklabels=target_names)
+    plt.title('Confusion Matrix')
+    plt.xlabel('Predicted')
+    plt.ylabel('Actual')
+
+    print("\nClassification Report:\n", classification_report(y_test, y_pred, target_names=target_names, zero_division=0))
+
+    # ROC / PR for 'High' vs rest if available
+    if 'High' in label_encoder.classes_:
+        pos_label = int(label_encoder.transform(['High'])[0])
+        try:
+            fpr, tpr, _ = roc_curve((y_test == pos_label).astype(int), y_pred_proba_pos)
+            roc_auc = auc(fpr, tpr)
+            plt.subplot(2, 2, 2)
+            plt.plot(fpr, tpr, label=f'ROC curve (AUC = {roc_auc:.2f})')
+            plt.plot([0, 1], [0, 1], 'k--')
+            plt.title('ROC Curve (High vs Others)')
+            plt.legend(loc="lower right")
+
+            precision, recall, _ = precision_recall_curve((y_test == pos_label).astype(int), y_pred_proba_pos)
+            plt.subplot(2, 2, 3)
+            plt.plot(recall, precision, label='Precision-Recall curve')
+            plt.title('Precision-Recall Curve (High vs Others)')
+            plt.legend(loc="lower left")
+        except Exception as e:
+            print("Warning: ROC/PR plotting failed:", str(e))
+    else:
+        print("Warning: 'High' class not available — skipping ROC/PR plotting")
+
+    plt.tight_layout()
+    plt.savefig('model_performance_report.png')
+    plt.close()
+    print("Debug: model_performance_report.png saved.")
+
+def create_executive_summary_dashboard(risk_categories):
+    setup_plot_style()
+    plt.figure(figsize=(10, 6))
+    sns.countplot(x=risk_categories, palette=[RISK_COLORS.get(x, "#333333") for x in pd.unique(risk_categories)])
+    plt.title('Executive Summary: Risk Distribution')
+    plt.savefig('executive_dashboard.png')
+    plt.close()
+    print("Debug: executive_dashboard.png saved.")
+
+def create_business_insights_report(data):
+    setup_plot_style()
+    plt.figure(figsize=(10, 6))
+    if 'Overall_Risk_Category' in data.columns and 'Quality %' in data.columns:
+        sns.boxplot(x='Overall_Risk_Category', y='Quality %', data=data, hue='Overall_Risk_Category', palette=RISK_COLORS)
+        plt.title('Business Insights: Quality % by Risk Category')
+        plt.savefig('business_insights_report.png')
+        plt.close()
+        print("Debug: business_insights_report.png saved.")
+    else:
+        print("Warning: Cannot create business insights plot (columns missing)")
+
+def create_client_segmentation_analysis(data):
+    setup_plot_style()
+    plt.figure(figsize=(10, 6))
+    if 'Customer In Exp In Years' in data.columns and 'Quality %' in data.columns:
+        sns.scatterplot(x='Customer In Exp In Years', y='Quality %', hue='Overall_Risk_Category', data=data, palette=RISK_COLORS)
+        plt.title('Client Segmentation: Experience vs Quality')
+        plt.savefig('client_segmentation_analysis.png')
+        plt.close()
+        print("Debug: client_segmentation_analysis.png saved.")
+    else:
+        print("Warning: Cannot create client segmentation plot (columns missing)")
+
+def export_summary_report(data):
+    cols = ['Account Number', 'Overall_Risk_Category', 'Predictive_Churn_Probability', 'Priority_Score']
+    cols_present = [c for c in cols if c in data.columns]
+    if cols_present:
+        data[cols_present].to_csv('summary_report.csv', index=False)
+        print("Debug: summary_report.csv saved.")
+    else:
+        print("Warning: Some summary columns missing. summary_report.csv not saved.")
+
+def export_readme():
+    with open('README.txt', 'w') as f:
+        f.write("Customer Risk Analysis Output\n\nFiles:\n- comprehensive_risk_clients.csv: Full dataset with predictions and scores\n- flagged_risk_clients.csv: High & Medium risk clients (flagged)\n- full_test_set.csv: Test-set predictions (if available)\n- all_predictions.csv: All predictions CSV\n- summary_report.csv: Short summary CSV\n- model_performance_report.png: Model metrics\n- comprehensive_dashboard.png: Risk dashboard\n- executive_dashboard.png: Executive summary\n- business_insights_report.png: Business insights\n- client_segmentation_analysis.png: Client segmentation\n")
+    try:
+        files.download('README.txt')
+    except Exception:
+        print("Debug: README.txt created in working directory (download might not work in non-Colab env).")
+
+# ----------------------------
+# Training pipeline
+# ----------------------------
+def train_model(data_in, numerical_features, categorical_features):
+    data, num_feats, cat_feats = preprocess_data(data_in.copy(), numerical_features, categorical_features)
+
+    # One-hot encode categorical features (only those present)
+    if len(cat_feats) > 0:
+        data = pd.get_dummies(data, columns=cat_feats, prefix=cat_feats)
+    encoded_features = [col for col in data.columns if any(col.startswith(cat + '_') for cat in cat_feats)]
+
+    # Feature columns are numeric features + encoded categorical features present
+    feature_columns = [c for c in num_feats + encoded_features if c in data.columns]
+    if len(feature_columns) == 0:
+        raise ValueError("No feature columns available for training. Check your numerical/categorical feature lists and input file.")
+
+    # Label encoding
+    label_encoder = LabelEncoder()
+    y = label_encoder.fit_transform(data['Overall_Risk_Category'])
+    X = data[feature_columns]
+
+    print("Debug: X shape:", X.shape, "y shape:", y.shape)
+    print("Debug: y distribution:\n", pd.Series(label_encoder.inverse_transform(np.unique(y))).value_counts() if len(y)>0 else "empty")
+
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, stratify=y, random_state=SEED)
+    print("Debug: X_train shape:", X_train.shape, "X_test shape:", X_test.shape)
+
+    # SMOTE to help class imbalance
+    try:
+        smote = SMOTE(random_state=SEED, k_neighbors=3)
+        X_train, y_train = smote.fit_resample(X_train, y_train)
+        print("Debug: Post-SMOTE Training Label Distribution:\n", pd.Series(label_encoder.inverse_transform(y_train)).value_counts(normalize=True) * 100)
+    except Exception as e:
+        print("Warning: SMOTE failed or skipped:", str(e))
+
+    # Scaling
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
+
+    # compute class weights
+    class_weights = compute_class_weight('balanced', classes=np.unique(y_train), y=y_train)
+    class_weight_dict = dict(zip(np.unique(y_train), class_weights))
+    print("Debug: Class weights:", class_weight_dict)
+
+    # create keras model factory using n_features and output classes
+    def create_model():
+        n_features = X_train_scaled.shape[1]
+        n_classes = len(label_encoder.classes_)
+        model = tf.keras.Sequential([
+            tf.keras.layers.InputLayer(input_shape=(n_features,)),
+            tf.keras.layers.Dense(64, activation='relu', kernel_regularizer=tf.keras.regularizers.l2(0.01)),
+            tf.keras.layers.Dense(32, activation='relu', kernel_regularizer=tf.keras.regularizers.l2(0.01)),
+            tf.keras.layers.Dense(n_classes, activation='softmax')
+        ])
+        model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
+                      loss='sparse_categorical_crossentropy',
+                      metrics=['accuracy'])
+        return model
+
+    # scikeras wrapper
+    model = KerasClassifier(model=create_model,
+                            epochs=50,
+                            batch_size=32,
+                            verbose=1,
+                            validation_split=0.15,
+                            class_weight=class_weight_dict,
+                            callbacks=[tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)],
+                            random_state=SEED)
+
+    print("Debug: Training model...")
+    model.fit(X_train_scaled, y_train)
+
+    # Evaluate / predictions on test set
+    test_probs = model.predict_proba(X_test_scaled)
+    y_pred = np.argmax(test_probs, axis=1)
+    print("Debug: Test probability distribution:", test_probs.min(), test_probs.max(), test_probs.mean(axis=0))
+
+    # apply model to full dataset, compute priority, save files
+    data = create_comprehensive_risk_analysis(data, model, scaler, feature_columns, X_test, y_test, label_encoder)
+
+    # create reports and plots
+    # Prepare y_pred_proba_pos for 'High' class if available
+    if 'High' in label_encoder.classes_:
+        high_idx = int(label_encoder.transform(['High'])[0])
+        y_pred_proba_pos = test_probs[:, high_idx]
+    else:
+        # fallback
+        y_pred_proba_pos = test_probs.max(axis=1)
+
+    try:
+        create_model_performance_report(y_test, y_pred, y_pred_proba_pos, label_encoder)
+    except Exception as e:
+        print("Warning: create_model_performance_report failed:", str(e))
+
+    try:
+        create_comprehensive_dashboard(data, feature_columns)
+    except Exception as e:
+        print("Warning: create_comprehensive_dashboard failed:", str(e))
+
+    try:
+        create_executive_summary_dashboard(data['Overall_Risk_Category'])
+    except Exception as e:
+        print("Warning: create_executive_summary_dashboard failed:", str(e))
+
+    try:
+        create_business_insights_report(data)
+    except Exception as e:
+        print("Warning: create_business_insights_report failed:", str(e))
+
+    try:
+        create_client_segmentation_analysis(data)
+    except Exception as e:
+        print("Warning: create_client_segmentation_analysis failed:", str(e))
+
+    try:
+        export_summary_report(data)
+    except Exception as e:
+        print("Warning: export_summary_report failed:", str(e))
+
+    try:
+        export_readme()
+    except Exception:
+        pass
+
+    return model, scaler, feature_columns, X_test, y_test, y_pred, label_encoder, data
+
+# ----------------------------
+# Main
+# ----------------------------
+if __name__ == "__main__":
+    try:
+        print("Please upload your Excel data file...")
+        uploaded = files.upload()
+        if not uploaded:
+            raise FileNotFoundError("No file uploaded.")
+
+        file_name = list(uploaded.keys())[0]
+        # load sheet-agnostic (first sheet)
+        data = pd.read_excel(io.BytesIO(uploaded[file_name]))
+        data.columns = data.columns.str.strip()  # trim whitespace
+        print(f"Debug: Loaded data from {file_name}")
+        print(f"Debug: Data shape: {data.shape}")
+        print(f"Debug: Data columns: {data.columns.tolist()}")
+
+        # Define features (updated to include factors from churn_feature_importance.xlsx with exact column names from data)
+        numerical_features = [
+            'Call Compliance',
+            'Call Made in VICI on Scheduled Time',
+            'Product Setup Price',
+            'Total Calls Made in VICI',
+            'MRF',
+            'Avg Call Duration in VICI',
+            'Total Scheduled Calls',
+            'Inbound Calls in 30 days',
+            'Days To Activate Listing',
+            'Customer In Exp In Years',
+            'Days To Website',
+            'Website Issue TT Count',
+            'Count Of Leads',
+            'Quality %'
+        ]
+        categorical_features = [
+            'Industry',
+            'Misrep Code 1',
+            'City Size',
+            'Misrep Code 2',
+            'Misrep Code 3',
+            'Product',
+            'Card Type',
+            'Language Spoken',
+            'Agent Tenure',
+            'ExistingListing',
+            'AB/NAB'
+        ]
+
+        (model, scaler, feature_columns,
+         X_test, y_test, y_pred, label_encoder, data_out) = train_model(data, numerical_features, categorical_features)
+
+        # Final executive summary counts (safe checks)
+        total_clients = len(data_out)
+        high_risk_count = int((data_out['Overall_Risk_Category'].str.contains('High', na=False)).sum()) if 'Overall_Risk_Category' in data_out.columns else 0
+        unpaid_count = int((data_out['Payment Status'] == 'Unpaid').sum()) if 'Payment Status' in data_out.columns else 0
+        accuracy = accuracy_score(y_test, y_pred) if (y_test is not None and len(y_test) > 0) else 0.0
+
+        # compute recall for 'High' if present in classification report
+        try:
+            report = classification_report(y_test, y_pred, target_names=label_encoder.inverse_transform(np.unique(y_test)), output_dict=True, zero_division=0)
+            high_recall = report.get('High', {}).get('recall', 0.0)
+        except Exception:
+            high_recall = 0.0
+
+        print("\nEXECUTIVE SUMMARY:")
+        print(f"• Total Clients: {total_clients:,}")
+        print(f"• High-Risk Clients: {high_risk_count:,} ({(high_risk_count/total_clients*100) if total_clients else 0:.1f}%)")
+        print(f"• Unpaid Accounts: {unpaid_count:,}")
+        print(f"• Model Accuracy: {accuracy:.1%}")
+        print(f"• High-Risk Detection Recall: {high_recall:.1%}")
+
+        # Download created files (only if present)
+        to_download = ['comprehensive_risk_clients.csv', 'flagged_risk_clients.csv', 'full_test_set.csv', 'all_predictions.csv', 'summary_report.csv',
+                       'comprehensive_dashboard.png', 'executive_dashboard.png', 'business_insights_report.png', 'client_segmentation_analysis.png',
+                       'model_performance_report.png', 'README.txt']
+        for fname in to_download:
+            if os.path.exists(fname):
+                try:
+                    files.download(fname)
+                except Exception:
+                    print(f"Debug: {fname} exists but files.download failed in this environment. File is in working directory.")
+            else:
+                print(f"Debug: {fname} not found (may not have been generated).")
+
+    except Exception as e:
+        print(f"❌ Error: {str(e)}")
+        import traceback
+        traceback.print_exc()
